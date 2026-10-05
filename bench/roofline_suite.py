@@ -222,6 +222,10 @@ def main():
             if keepalive is not None:
                 keepalive.set()
         report["perf_rooflines"] = collected
+        # where the perf/W's ANE power came from (issue #289): powermetrics, or the SMC rail
+        sat = next((e.get("summary") for e in collected
+                    if e.get("script") == "device_saturation_sweep.py" and e.get("summary")), None)
+        report["ane_power_source"] = ((sat or {}).get("meta") or {}).get("ane_power_source")
     else:
         print("\n[perf] skipped (pass --perf for the fast headline run, --perf-full for everything)")
 

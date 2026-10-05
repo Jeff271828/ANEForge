@@ -23,6 +23,7 @@ import numpy as np
 # Reuse the sibling harness's helpers + workload math so we don't duplicate it.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import device_compare as dc  # noqa: E402
+import _ane_rail  # noqa: E402
 
 HAVE_ANE, HAVE_MLX, HAVE_TV, HAVE_HF = dc.HAVE_ANE, dc.HAVE_MLX, dc.HAVE_TV, dc.HAVE_HF
 HAVE_SUDO = dc.HAVE_SUDO
@@ -50,6 +51,24 @@ RESULTS: dict[str, dict] = {}
 IDLE: dict[str, float] = {}   # per-rail idle mW, sampled once at start
 IDLE_PKG = 0.0                # total-package idle mW
 
+# SMC rail PP0b (bench/_ane_rail.py, #289): sampled beside powermetrics, and the ANE power
+# source when powermetrics has none (Apple M6). None without an SMC rail (e.g. CI).
+RAIL = _ane_rail.RailSampler.create() if HAVE_SUDO else None
+RAIL_IDLE: list[dict] = []    # rail samples from the idle baseline
+RAIL_MIN_WINDOW = 10.0        # PP0b updates ~1/s, so a rail-sourced window is at least this long
+PM_HAS_ANE = True             # set by sample_idle(): False when powermetrics prints no ANE power
+PM_HAS_CPU = True             # likewise for CPU power (M6 reads 0 at idle and under CPU load)
+
+
+def ane_power_source() -> str | None:
+    """'powermetrics', 'smc_pp0b' (no ANE field, rail fallback), or None (no ANE power)."""
+    if not HAVE_SUDO:
+        return None
+    # ANEFORGE_ANE_POWER=smc_pp0b exercises the fallback on a chip whose powermetrics has the field
+    if PM_HAS_ANE and os.environ.get("ANEFORGE_ANE_POWER") != "smc_pp0b":
+        return "powermetrics"
+    return "smc_pp0b" if RAIL is not None else None
+
 
 # power harness
 def _parse_pm_per_sample(txt: str) -> tuple[dict[str, list[float]], list[float]]:
@@ -69,26 +88,36 @@ def _parse_pm_per_sample(txt: str) -> tuple[dict[str, list[float]], list[float]]
 
 def sample_idle(seconds: float) -> None:
     """Sample a no-workload idle baseline (per rail) ONCE. Stores median mW/rail."""
-    global IDLE_PKG
+    global IDLE_PKG, PM_HAS_ANE, PM_HAS_CPU
     if not HAVE_SUDO:
         return
     samples = max(20, int(seconds / (PM_INTERVAL_MS / 1000.0)) + 5)
+    if RAIL is not None:          # the rail needs a longer baseline: it updates ~1/s
+        samples = max(samples, int(RAIL_MIN_WINDOW / (PM_INTERVAL_MS / 1000.0)))
+        RAIL.start()
     log = Path("/tmp/pm_wattc_idle.log")
     pm = subprocess.Popen(
         ["sudo", "-n", "powermetrics", "--samplers", "ane_power,cpu_power,gpu_power",
          "--sample-rate", str(PM_INTERVAL_MS), "--sample-count", str(samples)],
         stdout=open(log, "w"), stderr=subprocess.DEVNULL)
     pm.wait()
+    if RAIL is not None:
+        RAIL_IDLE[:] = RAIL.stop()
     per, pkg = _parse_pm_per_sample(log.read_text())
     for rail, v in per.items():
         IDLE[rail] = float(np.median(v)) if v else 0.0
     IDLE_PKG = float(np.median(pkg)) if pkg else sum(IDLE.values())
+    PM_HAS_ANE = bool(per.get("ane"))
+    PM_HAS_CPU = any(x > 0 for x in per.get("cpu", []))
 
 
 def measure_energy(run_once, *, tag: str, window: float = WINDOW) -> dict | None:
     """Sustained-loop powermetrics around run_once(): idle-subtracted ACTIVE per rail + package, median/CV/min/p90, iter time, low-confidence flags."""
     if not HAVE_SUDO:
         return None
+    source = ane_power_source()
+    if source == "smc_pp0b":
+        window = max(window, RAIL_MIN_WINDOW)
     for _ in range(5):              # warmup before the sampling window
         run_once()
     samples = max(8, int(window / (PM_INTERVAL_MS / 1000.0)))
@@ -98,6 +127,8 @@ def measure_energy(run_once, *, tag: str, window: float = WINDOW) -> dict | None
          "--sample-rate", str(PM_INTERVAL_MS), "--sample-count", str(samples)],
         stdout=open(log, "w"), stderr=subprocess.DEVNULL)
     time.sleep(0.35)                # let the sampler spin up before we count iters
+    if RAIL is not None:
+        RAIL.start()
     t0 = time.perf_counter()
     n = 0
     while pm.poll() is None:        # drive work for the ENTIRE sampling window
@@ -105,6 +136,7 @@ def measure_energy(run_once, *, tag: str, window: float = WINDOW) -> dict | None
         n += 1
     dt = time.perf_counter() - t0
     pm.wait()
+    rs = _ane_rail.summarize(RAIL.stop(), RAIL_IDLE) if RAIL is not None else None
     per, pkg = _parse_pm_per_sample(log.read_text())
     ns = len(pkg)
     flags: list[str] = []
@@ -142,6 +174,27 @@ def measure_energy(run_once, *, tag: str, window: float = WINDOW) -> dict | None
 
     if ns and ns < 12:
         flags.append(f"only {ns} pm samples - short window, treat as indicative")
+
+    # SMC rail (#289): recorded beside powermetrics, and its ANE term (plus its CPU clusters
+    # when powermetrics has no CPU power either, as on M6) replaces powermetrics' in the package
+    out["ane_power_source"] = source
+    if rs is not None:
+        add_mW = rs["ane_active_mW"] - (out["ane_active_mW"] if PM_HAS_ANE else 0.0)
+        if not PM_HAS_CPU:
+            add_mW += rs["cpu_active_mW"]
+        rs["active_pkg_W"] = out["active_pkg_W"] + add_mW / 1000.0
+        out["rail"] = rs
+        if source == "smc_pp0b":
+            out["ane_loaded_mW"], out["ane_active_mW"] = rs["ane_loaded_mW"], rs["ane_active_mW"]
+            if not PM_HAS_CPU:
+                out["cpu_loaded_mW"], out["cpu_active_mW"] = rs["cpu_loaded_mW"], rs["cpu_active_mW"]
+            for k in ("active_pkg_W", "active_pkg_mean_W", "active_pkg_min_W", "active_pkg_p90_W"):
+                if k in out:
+                    out[k] += add_mW / 1000.0
+            flags.append("ANE power from the SMC rail PP0b"
+                         + ("" if PM_HAS_ANE else " (powermetrics has none)")
+                         + ("" if PM_HAS_CPU else ", CPU from the IOReport clusters"))
+            flags.extend(rs["flags"])
     out["flags"] = flags
     return out
 

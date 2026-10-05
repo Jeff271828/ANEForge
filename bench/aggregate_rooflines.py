@@ -124,6 +124,9 @@ def _perf_headline(report: dict) -> dict:
     sat = _perf_summary(report, "device_saturation_sweep.py")
     gane = (((sat or {}).get("peaks") or {}).get("gemm") or {}).get("ANE") or {}
     h["perf_per_w"] = gane.get("peak_perf_per_W")
+    # where its ANE power came from (#289); submissions from before the field are powermetrics
+    h["perf_per_w_source"] = (report.get("ane_power_source")
+                              or ((sat or {}).get("meta") or {}).get("ane_power_source"))
     if h["gemm_tflops"] is None and isinstance(gane.get("peak_gflops"), (int, float)):
         h["gemm_tflops"] = gane["peak_gflops"] / 1000.0
     if h["bw_gbps"] is None:
@@ -238,6 +241,7 @@ def render(reports: list[dict]) -> str:
     # --- Performance rooflines (headline) ---
     perf_rows = []
     any_decode_blocked = False
+    any_rail = False
     offconfig_chips = []
     for _, g in sorted(groups.items(), key=lambda kv: str(kv[1]["latest"]["machine"]["hardware"].get("chip"))):
         # use the most recent submission that carries perf data
@@ -260,10 +264,14 @@ def render(reports: list[dict]) -> str:
             any_decode_blocked = True
         elif h.get("decode_offconfig"):
             offconfig_chips.append(hw.get("chip", "?"))
+        ppw = _c(h["perf_per_w"], ".0f")
+        if h["perf_per_w"] is not None and h.get("perf_per_w_source") == "smc_pp0b":
+            ppw += " (rail)"
+            any_rail = True
         perf_rows.append(
             f"| {hw.get('chip','?')} | {hw.get('model_identifier','?')} "
             f"| {_c(h['gemm_tflops'], '.1f')} | {_c(h['bw_gbps'], '.2g')} "
-            f"| {_c(h['ridge'], '.0f')} | {_c(h['perf_per_w'], '.0f')} "
+            f"| {_c(h['ridge'], '.0f')} | {ppw} "
             f"| {decode} | {power} |"
         )
 
@@ -284,6 +292,15 @@ def render(reports: list[dict]) -> str:
             *perf_rows,
             "",
         ]
+        if any_rail:
+            lines += [
+                "_`(rail)` perf/W: powermetrics reports no ANE power on this chip, so the ANE term "
+                "comes from the SMC rail PP0b minus the CPU cluster that shares it "
+                "(`bench/_ane_rail.py`, #289). That is a measured rail rather than powermetrics' "
+                "model estimate, so it is not the same measurement as the other rows; "
+                "compare it with them loosely._",
+                "",
+            ]
         if any_decode_blocked:
             lines += [
                 "_`n/a` decode = a stale datapoint from before the tiled vocab head (#181). The old "
@@ -349,6 +366,8 @@ def build_headline_json(reports: list[dict]) -> list[dict]:
         })
         if hw.get("cpu_levels"):
             rows[-1]["cpu_levels"] = hw["cpu_levels"]
+        if h.get("perf_per_w_source"):
+            rows[-1]["peak_perf_per_w_source"] = h["perf_per_w_source"]
     return rows
 
 

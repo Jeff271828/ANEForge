@@ -270,11 +270,17 @@ def _attach_power(dev_row, run_once, tag, flops, device):
            "ane_active_mW": e.get("ane_active_mW", float("nan")),
            "gpu_active_mW": e.get("gpu_active_mW", float("nan")),
            "cpu_active_mW": e.get("cpu_active_mW", float("nan")),
+           "ane_power_source": e.get("ane_power_source"),
            "flags": list(e.get("flags", []))}
+    if e.get("rail"):
+        rec["rail"] = e["rail"]
     if sane and e.get("iter_ms"):
         thr = flops / (e["iter_ms"] / 1e3)  # FLOP/s at the sustained-loop rate
         rec["gflops_sustained"] = thr / 1e9
         rec["perf_per_W"] = (thr / 1e9) / apw  # GFLOP/s/W
+        rpw = (e.get("rail") or {}).get("active_pkg_W", float("nan"))
+        if rpw == rpw and rpw > 0:         # the same with the rail's ANE term (side by side)
+            rec["perf_per_W_rail"] = (thr / 1e9) / rpw
     # ANE work that reads ~0 on the ANE rail is a sampling miss
     if device == "ANE" and e.get("ane_active_mW", 0.0) < 5.0 and not rec["flags"]:
         rec["flags"].append("ANE rail ~0 mW during ANE work - likely a 100ms sampling miss")
@@ -296,6 +302,7 @@ def _peaks(prim):
     for dev in ("CPU", "GPU", "ANE"):
         best_thr = (-1.0, None, None)   # (gflops, size, relerr)
         best_ppw = (-1.0, None)         # (perf_per_W, size)
+        best_rail = None                # peak perf_per_W_rail (rail ANE term, side by side)
         for r in rows:
             d = r["devices"].get(dev, {})
             if "gflops" in d and d["gflops"] > best_thr[0]:
@@ -303,11 +310,14 @@ def _peaks(prim):
             p = d.get("power", {})
             if p.get("perf_per_W") and p["perf_per_W"] > best_ppw[0]:
                 best_ppw = (p["perf_per_W"], r[keyname])
+            if p.get("perf_per_W_rail") and p["perf_per_W_rail"] > (best_rail or -1.0):
+                best_rail = p["perf_per_W_rail"]
         if best_thr[1] is not None:
             out[dev] = {"peak_gflops": best_thr[0], "peak_gflops_size": best_thr[1],
                         "peak_gflops_relerr": best_thr[2],
                         "peak_perf_per_W": best_ppw[0] if best_ppw[1] is not None else None,
-                        "peak_perf_per_W_size": best_ppw[1]}
+                        "peak_perf_per_W_size": best_ppw[1],
+                        "peak_perf_per_W_rail": best_rail}
     return out
 
 
@@ -361,6 +371,8 @@ def main():
         wc.sample_idle(3.0)
         print(f" idle: ANE {wc.IDLE.get('ane',0):.0f} / GPU {wc.IDLE.get('gpu',0):.0f} / "
               f"CPU {wc.IDLE.get('cpu',0):.0f} mW (pkg {wc.IDLE_PKG:.0f} mW)")
+        print(f" ANE power source: {wc.ane_power_source()}"
+              + ("  (SMC rail recorded side by side)" if wc.RAIL is not None else ""))
 
     sweep_gemm(gemm_ns, do_power)
     sweep_conv(conv_cfg, do_power)
@@ -371,6 +383,7 @@ def main():
         "gemm_ns": gemm_ns, "conv_configs": conv_cfg, "conv_spatial": CONV_SPATIAL,
         "power_window_s": POWER_WINDOW, "reps": REPS,
         "idle_mW": dict(wc.IDLE) if do_power else {}, "idle_pkg_mW": wc.IDLE_PKG if do_power else 0.0,
+        "ane_power_source": wc.ane_power_source() if do_power else None,
     }
     out = Path(__file__).resolve().parent / "results" / "device_saturation_sweep_results.json"
     out.write_text(json.dumps(RESULTS, indent=2, default=lambda o: None))
